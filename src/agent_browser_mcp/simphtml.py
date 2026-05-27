@@ -826,7 +826,7 @@ def execute_js_rich(script, driver, no_monitor=False):
         response = driver.execute_js(script)
         result = response['data'] if 'data' in response else response.get('result')
         if response.get('closed', 0) == 1: reloaded = True
-        time.sleep(1) 
+        if not no_monitor: time.sleep(1)  # settle time only matters when we diff the DOM after
     except Exception as e:
         error = e.args[0] if e.args else str(e)
         if isinstance(error, dict): error.pop('stack', None)

@@ -220,17 +220,21 @@ def scan_page(
     }
 
 
-@mcp.tool(description="Execute arbitrary JS in the current page context or send JSON CDP bridge commands through the page bridge.")
+@mcp.tool(description=(
+    "Execute arbitrary JS in the current page context or send JSON CDP bridge commands through the page bridge. "
+    "Fast by default. Set monitor=true to also capture the DOM diff + transient texts produced by the script "
+    "(slower: serializes the full page before and after and runs a structural diff)."
+))
 def execute_js(
     script: str,
     session_id: Optional[str] = None,
-    no_monitor: bool = False,
+    monitor: bool = False,
 ) -> dict[str, Any]:
     driver = require_driver()
     if session_id is not None:
         switch_session(session_id=session_id)
     ensure_sessions()
-    return simphtml.execute_js_rich(script, driver, no_monitor=no_monitor)
+    return simphtml.execute_js_rich(script, driver, no_monitor=not monitor)
 
 
 @mcp.tool(description="Call a single Chrome DevTools Protocol command on the current or specified tab.")
@@ -291,13 +295,14 @@ def capture_page_screenshot(
         b64 = data["data"]
     else:
         b64 = data
-    out: dict[str, Any] = {"format": format, "base64": b64}
     if save_path:
+        # Saved to disk → return the path only. Echoing the full base64 back to the model
+        # would dump tens-to-hundreds of KB of text into context for nothing.
         path = Path(save_path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(base64.b64decode(b64))
-        out["saved_to"] = str(path)
-    return out
+        return {"format": format, "saved_to": str(path), "bytes": path.stat().st_size}
+    return {"format": format, "base64": b64}
 
 
 @mcp.tool(description="Take a desktop screenshot of the whole screen using mss; useful for physical-input verification.")

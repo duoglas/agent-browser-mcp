@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .server import ROOT, ensure_config_js, get_driver, chrome_extension_dir, mcp
+
+SERVICE_LABEL = "com.agent-browser-mcp.bridge"
 
 
 def cmd_extension_path() -> int:
@@ -69,6 +74,109 @@ def cmd_doctor() -> int:
     return 0
 
 
+def cmd_serve() -> int:
+    """Run TMWebDriver as a standalone, always-on bridge owner.
+
+    Both Claude clients then connect in remote mode, so quitting either client never tears down
+    the bridge. Intended to be launched by launchd at login (see `install-service`).
+
+    If a client transiently owns the port (e.g. started before this service), we wait in a single
+    long-lived process and claim ownership the moment the port frees — no launchd restart churn."""
+    from .tmwebdriver import TMWebDriver
+
+    ensure_config_js()
+    host = os.environ.get("AGENT_BROWSER_TMWD_HOST", "127.0.0.1")
+    port = int(os.environ.get("AGENT_BROWSER_TMWD_PORT", "18765"))
+    waited = False
+    while True:
+        driver = TMWebDriver(host=host, port=port)  # binds only if the port is free
+        if not driver.is_remote:
+            break
+        if not waited:
+            print("[serve] bridge port owned by another process; waiting to take over...",
+                  file=sys.stderr, flush=True)
+            waited = True
+        time.sleep(15)
+    print(f"[serve] TMWebDriver bridge owning ws://{host}:{port} (http {port + 1}). Ctrl-C to stop.",
+          flush=True)
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        return 0
+
+
+def _plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{SERVICE_LABEL}.plist"
+
+
+def _log_dir() -> Path:
+    d = Path.home() / "Library" / "Logs" / "agent-browser-mcp"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def cmd_install_service() -> int:
+    """Write and load a launchd LaunchAgent that keeps the bridge running at login (macOS)."""
+    if sys.platform != "darwin":
+        print("install-service currently supports macOS (launchd) only.", file=sys.stderr)
+        return 1
+    plist = _plist_path()
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    log_dir = _log_dir()
+    args = [sys.executable, "-m", "agent_browser_mcp.cli", "serve"]
+    args_xml = "\n".join(f"      <string>{a}</string>" for a in args)
+    plist.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n'
+        '<dict>\n'
+        f'  <key>Label</key><string>{SERVICE_LABEL}</string>\n'
+        '  <key>ProgramArguments</key>\n'
+        f'  <array>\n{args_xml}\n  </array>\n'
+        '  <key>RunAtLoad</key><true/>\n'
+        '  <key>KeepAlive</key><true/>\n'
+        '  <key>ThrottleInterval</key><integer>10</integer>\n'
+        f'  <key>StandardOutPath</key><string>{log_dir / "bridge.out.log"}</string>\n'
+        f'  <key>StandardErrorPath</key><string>{log_dir / "bridge.err.log"}</string>\n'
+        '</dict>\n'
+        '</plist>\n',
+        encoding="utf-8",
+    )
+    uid = os.getuid()
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{SERVICE_LABEL}"],
+                   capture_output=True)  # ignore if not loaded
+    r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(plist)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        # Fall back to legacy load for older macOS
+        subprocess.run(["launchctl", "load", "-w", str(plist)], capture_output=True)
+    print(json.dumps({
+        "label": SERVICE_LABEL,
+        "plist": str(plist),
+        "program": args,
+        "logs": str(log_dir),
+        "status": "loaded",
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_uninstall_service() -> int:
+    if sys.platform != "darwin":
+        print("uninstall-service supports macOS (launchd) only.", file=sys.stderr)
+        return 1
+    plist = _plist_path()
+    uid = os.getuid()
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{SERVICE_LABEL}"], capture_output=True)
+    subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+    if plist.exists():
+        plist.unlink()
+    print(json.dumps({"label": SERVICE_LABEL, "plist": str(plist), "status": "removed"},
+                     ensure_ascii=False, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-browser-mcp",
@@ -78,6 +186,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("extension-path", help="Print the unpacked Chrome extension path")
     sub.add_parser("doctor", help="Run local diagnostics and print JSON status")
     sub.add_parser("print-hermes-config", help="Print a ready-to-paste Hermes MCP config snippet")
+    sub.add_parser("serve", help="Run the always-on TMWebDriver bridge (used by the launchd service)")
+    sub.add_parser("install-service", help="Install + load a launchd LaunchAgent so the bridge runs at login (macOS)")
+    sub.add_parser("uninstall-service", help="Unload + remove the launchd LaunchAgent (macOS)")
     return parser
 
 
@@ -91,6 +202,12 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor()
     if args.command == "print-hermes-config":
         return cmd_print_hermes_config()
+    if args.command == "serve":
+        return cmd_serve()
+    if args.command == "install-service":
+        return cmd_install_service()
+    if args.command == "uninstall-service":
+        return cmd_uninstall_service()
 
     ensure_config_js()
     get_driver()

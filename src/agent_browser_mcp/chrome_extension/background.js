@@ -1,18 +1,43 @@
 // background.js - Cookie + CDP Bridge
-chrome.runtime.onInstalled.addListener(() => {
+//
+// CSP stripping is scoped to tabs under active automation (session rules with condition.tabIds),
+// NOT globally — normal browsing keeps its Content-Security-Policy intact. A tab is "armed" on the
+// first execute_js it receives; subsequent navigations in that tab then load with CSP removed so the
+// MAIN-world eval path works. A CSP-restricted page that is already loaded when first driven falls
+// back to the CDP path (Runtime.evaluate bypasses page CSP), so no reload is required.
+const armedTabs = new Map(); // tabId -> sessionRuleId
+let _nextCspRuleId = 9000;
+
+async function armTabCsp(tabId) {
+  if (!tabId || armedTabs.has(tabId)) return;
+  const ruleId = _nextCspRuleId++;
+  armedTabs.set(tabId, ruleId);
+  try {
+    await chrome.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: [ruleId],
+      addRules: [{
+        id: ruleId, priority: 1,
+        action: { type: 'modifyHeaders', responseHeaders: [
+          { header: 'content-security-policy', operation: 'remove' },
+          { header: 'content-security-policy-report-only', operation: 'remove' }
+        ]},
+        condition: { tabIds: [tabId], resourceTypes: ['main_frame', 'sub_frame'] }
+      }]
+    });
+  } catch (e) { console.warn('[TMWD] armTabCsp failed for tab', tabId, e); armedTabs.delete(tabId); }
+}
+
+async function disarmTabCsp(tabId) {
+  const ruleId = armedTabs.get(tabId);
+  if (!ruleId) return;
+  armedTabs.delete(tabId);
+  try { await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [ruleId] }); } catch (_) {}
+}
+
+chrome.runtime.onInstalled.addListener(async () => {
   console.log('CDP Bridge installed');
-  // Strip CSP headers to allow eval/inline scripts
-  chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [9999],
-    addRules: [{
-      id: 9999, priority: 1,
-      action: { type: 'modifyHeaders', responseHeaders: [
-        { header: 'content-security-policy', operation: 'remove' },
-        { header: 'content-security-policy-report-only', operation: 'remove' }
-      ]},
-      condition: { urlFilter: '*', resourceTypes: ['main_frame', 'sub_frame'] }
-    }]
-  });
+  // Remove the global CSP-strip rule left behind by older versions (no longer used).
+  try { await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [9999] }); } catch (_) {}
 });
 
 async function handleExtMessage(msg, sender) {
@@ -30,6 +55,12 @@ async function handleExtMessage(msg, sender) {
         const data = tabs.map(t => ({ id: t.id, url: t.url, title: t.title, active: t.active, windowId: t.windowId }));
         return { ok: true, data };
       }
+    } catch (e) { return { ok: false, error: e.message }; }
+  }
+  if (msg.cmd === 'newtab') {
+    try {
+      const tab = await chrome.tabs.create({ url: msg.url || 'about:blank' });
+      return { ok: true, data: { id: tab.id, url: tab.url, title: tab.title } };
     } catch (e) { return { ok: false, error: e.message }; }
   }
   if (msg.cmd === 'management') {
@@ -133,6 +164,15 @@ const isScriptable = url => url && /^https?:/.test(url);
 // --- Shared page/CDP script builder core ---
 function buildExecScript(code, errorHandler) {
   return `(async () => {
+    // Suppress modal dialogs so they can't block automation. Scoped to this (driven) tab and
+    // idempotent — installed on first exec, persists for the page. Tabs you never automate are
+    // untouched, so normal browsing keeps real alert/confirm/prompt.
+    if (!window.__tmwd_dlg) {
+      window.__tmwd_dlg = 1;
+      window.alert = function(){};
+      window.confirm = function(){ return true; };
+      window.prompt = function(_, d){ return d == null ? null : d; };
+    }
     function smartProcessResult(result) {
       if (result === null || result === undefined || typeof result !== 'object') return result;
       try { if (result.window === result && result.document) return '[Window: ' + (result.location?.href || 'about:blank') + ']'; } catch(_){}
@@ -247,6 +287,7 @@ async function handleWsExec(data) {
     ws.send(JSON.stringify({ type: 'error', id: data.id, error: 'No tabId provided' }));
     return;
   }
+  await armTabCsp(tabId); // strip CSP for this (now automated) tab's future navigations
   // Use onCreated listener to reliably capture new tabs (avoids race condition with query-diff)
   const newTabIds = new Set();
   const onCreated = (tab) => { newTabIds.add(tab.id); };
@@ -290,8 +331,11 @@ async function handleWsExec(data) {
         res = { ok: false, error: { name: 'Error', message: 'CDP fallback failed: ' + cdpErr.message, stack: '' } };
       }
     }
-    // Grace period for async tab creation (e.g. link click with target=_blank)
-    if (newTabIds.size === 0) await new Promise(r => setTimeout(r, 200));
+    // Grace period for async tab creation (e.g. link click with target=_blank) — only when the
+    // script plausibly opened a tab or navigated. Pure reads (the common case) skip the wait.
+    if (newTabIds.size === 0 && /window\.open|target\s*=|\.click\(|\blocation\b|\.submit\(|\.requestSubmit\(/.test(data.code)) {
+      await new Promise(r => setTimeout(r, 200));
+    }
     chrome.tabs.onCreated.removeListener(onCreated);
     // Get full info for captured new tabs
     const newTabs = [];
@@ -389,5 +433,5 @@ async function sendTabsUpdate() {
 chrome.tabs.onUpdated.addListener((_, changeInfo) => {
   if (changeInfo.status === 'complete') sendTabsUpdate();
 });
-chrome.tabs.onRemoved.addListener(() => sendTabsUpdate());
+chrome.tabs.onRemoved.addListener((tabId) => { disarmTabCsp(tabId); sendTabsUpdate(); });
 chrome.tabs.onCreated.addListener(() => sendTabsUpdate());

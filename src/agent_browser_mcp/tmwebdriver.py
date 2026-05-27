@@ -156,11 +156,31 @@ class TMWebDriver:
                 print(f"WS Connection closed: {self.address}")
                 driver._unregister_client(self)  
         
-        self.server = WebSocketServer(self.host, self.port, JSExecutor)  
-        server_thread = threading.Thread(target=self.server.serve_forever)  
-        server_thread.daemon = True  
-        server_thread.start()  
-        print(f"WebSocket server running on ws://{self.host}:{self.port}")  
+        self.server = WebSocketServer(self.host, self.port, JSExecutor)
+        server_thread = threading.Thread(target=self.server.serve_forever)
+        server_thread.daemon = True
+        server_thread.start()
+        print(f"WebSocket server running on ws://{self.host}:{self.port}")
+        self._start_keepalive()
+
+    def _start_keepalive(self) -> None:
+        """Server-driven keepalive: push a ping to every connected extension WS every 20s.
+        Inbound WS traffic reliably extends the MV3 service worker lifetime (Chrome 116+),
+        which is more robust than the extension's own chrome.alarms (clamped to >=30s)."""
+        def loop():
+            while True:
+                time.sleep(20)
+                for sess in list(self.sessions.values()):
+                    if sess.type in ('ws', 'ext_ws') and sess.ws_client and sess.disconnect_at is None:
+                        try: sess.ws_client.send_message('{"type":"ping"}')
+                        except Exception: pass
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
+
+    def _prune_buffers(self) -> None:
+        """Bound results/acks so a long-running owner doesn't leak orphaned (timed-out) entries."""
+        if len(self.results) > 500: self.results.clear()
+        if len(self.acks) > 500: self.acks.clear()
     
     def _register_client(self, session_id: str, client: WebSocket, session_info) -> None:  
         is_new_session = session_id not in self.sessions
@@ -185,14 +205,16 @@ class TMWebDriver:
         if session_id is None: session_id = self.default_session_id  
         if self.is_remote:
             print('remote_execute_js')
-            response = self._remote_cmd({"cmd": "execute_js", "sessionId": session_id, 
-                                         "code": code, "timeout": str(timeout)}).get('r', {})
+            response = self._remote_cmd({"cmd": "execute_js", "sessionId": session_id,
+                                         "code": code, "timeout": str(timeout)},
+                                        read_timeout=float(timeout) + 15).get('r', {})
             if response.get('error'): raise Exception(response['error'])
             return response
  
+        self._prune_buffers()
         session = self.sessions.get(session_id)
-        if not session or not session.is_active(): 
-            time.sleep(3)
+        if not session or not session.is_active():
+            time.sleep(1.5)
             session = self.sessions.get(session_id)
             if not session or not session.is_active(): 
                 alive_sessions = [s for s in self.sessions.values() if s.is_active()]
@@ -225,14 +247,15 @@ class TMWebDriver:
                 if not session.is_active(): hasjump = True
                 if hasjump and session.is_active():
                     return {'result': f"Session {session_id} reloaded.", "closed":1}
-            if time.time() - start_time > timeout:  
-                if tp in ['ws', 'ext_ws']:
-                    if hasjump: return {'result': f"Session {session_id} reloaded and new page is loading...", 'closed':1}
-                    if acked: return {"result": f"No response data in {timeout}s (ACK received, script may still be running)"}
-                    return {"result": f"No response data in {timeout}s (no ACK, script may not have been delivered)"}
-                elif tp == 'http':
-                    if acked: return {"result": f"Session {session_id} no response in {timeout}s (delivered but no result)"}
-                    return {"result": f"Session {session_id} no response in {timeout}s (script not polled)"}
+            if time.time() - start_time > timeout:
+                # Navigation mid-script is a legit outcome, not a failure → still return.
+                if tp in ['ws', 'ext_ws'] and hasjump:
+                    return {'result': f"Session {session_id} reloaded and new page is loading...", 'closed': 1}
+                # Genuine timeouts must raise so callers can tell them apart from real results
+                # (previously these masqueraded as a successful {"result": "..."} payload).
+                if acked:
+                    raise TimeoutError(f"No response in {timeout}s on session {session_id} (delivered/ACKed, script may still be running)")
+                raise TimeoutError(f"No response in {timeout}s on session {session_id} (script not delivered/polled)")
         
         result = self.results.pop(exec_id)  
         if exec_id in self.acks: self.acks.pop(exec_id)
@@ -242,8 +265,10 @@ class TMWebDriver:
         if newtabs: rr['newTabs'] = newtabs
         return rr
     
-    def _remote_cmd(self, cmd):
-        return requests.post(self.remote, headers={"Content-Type": "application/json"}, json=cmd).json()
+    def _remote_cmd(self, cmd, read_timeout=60):
+        # (connect, read) timeout: never hang forever if the bridge owner is wedged.
+        return requests.post(self.remote, headers={"Content-Type": "application/json"},
+                             json=cmd, timeout=(5, read_timeout)).json()
 
     def get_all_sessions(self):  
         if self.is_remote:
@@ -276,10 +301,13 @@ class TMWebDriver:
         print(f"成功设置默认会话: {self.default_session_id}: {info['url']}")  
         return self.default_session_id  
     
-    def jump(self, url, timeout=10): self.execute_js(f"window.location.href='{url}'", timeout=timeout)
+    def jump(self, url, timeout=10):
+        # json.dumps → safely quoted JS string literal (handles quotes/backslashes in url)
+        self.execute_js(f"window.location.href={json.dumps(url)}", timeout=timeout)
     def newtab(self, url=None):
-        if url is None: url = "http://www.baidu.com/robots.txt"
-        return self.execute_js(f'GM_openInTab("{url}");')
+        # Route through the extension's chrome.tabs.create (popup-blocker safe). The old
+        # GM_openInTab is a Tampermonkey API that doesn't exist in plain page context.
+        return self.execute_js(json.dumps({"cmd": "newtab", "url": url or "about:blank"}))
     
 if __name__ == "__main__":
     driver = TMWebDriver(host='127.0.0.1', port=18765)
